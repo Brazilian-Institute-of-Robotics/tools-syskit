@@ -14,6 +14,12 @@ module Syskit
             attr_reader :syskit
             # An async object to access the log stream
             attr_reader :syskit_log_stream
+            # The plan object we use to represent everything
+            attr_reader :plan
+            # The plan rebuilder that works on {#plan}
+            attr_reader :plan_rebuilder
+            # The object manager that is used when demarshalling data
+            def remote_object_manager; plan_rebuilder.remote_object_manager end
 
             # The toplevel layout
             attr_reader :main_layout
@@ -96,22 +102,44 @@ module Syskit
                 end
             end
 
+            def default_syskit_connection
+                Roby::Interface::Async::Interface.new
+            end
+
             # @param [Roby::Interface::Async::Interface] syskit the underlying
             #   syskit interface
             # @param [Integer] poll_period how often should the syskit interface
             #   be polled (milliseconds). Set to nil if the polling is already
             #   done externally
-            def initialize(parent: nil, syskit: Roby::Interface::Async::Interface.new, poll_period: 10)
+            def initialize(parent: nil,
+                           remote_name: 'localhost',
+                           remote_port: Roby::Distributed::DEFAULT_DROBY_PORT,
+                           poll_period: 10)
                 super(parent)
 
-                orocos_corba_nameservice = Orocos::CORBA::NameService.new(syskit.remote_name)
+                orocos_corba_nameservice = Orocos::CORBA::NameService.new(remote_name)
                 @name_service = Orocos::Async::NameService.new(orocos_corba_nameservice)
+                @plan = Roby::Plan.new
+                @plan_rebuilder = Roby::LogReplay::PlanRebuilder.new(plan: plan)
+                @syskit = Roby::Interface::Async::Interface.new(remote_name) do
+                    begin
+                        socket = TCPSocket.new(remote_name, remote_port)
+                        addr = socket.addr(true)
+                        plan.clear
+                        remote_object_manager.clear
+                        Roby::Interface::Client.new(
+                            Roby::Interface::DRobyChannel.new(
+                                socket, true, remote_object_manager: remote_object_manager),
+                                "#{addr[2]}:#{addr[1]}")
+                    rescue Errno::ECONNREFUSED
+                        Kernel.raise Roby::Interface::ConnectionError, "failed to connect to #{remote_name}:#{remote_port}"
+                    end
+                end
 
                 if poll_period
                     poll_syskit_interface(syskit, poll_period)
                 end
 
-                @syskit = syskit
                 create_ui
 
                 @current_job = nil
@@ -144,7 +172,9 @@ module Syskit
                 elsif syskit_log_stream
                     syskit_log_stream.close
                 end
-                @syskit_log_stream = Roby::Interface::Async::Log.new(syskit.remote_name, port: port)
+                @syskit_log_stream = Roby::Interface::Async::Log.new(
+                    syskit.remote_name, port: port,
+                    plan_rebuilder: plan_rebuilder)
                 syskit_log_stream.on_reachable do
                     deselect_job
                 end
@@ -174,7 +204,7 @@ module Syskit
 
             def update_tasks_info
                 if current_job
-                    job_task = syskit_log_stream.plan.find_tasks(Roby::Interface::Job).
+                    job_task = plan.find_tasks(Roby::Interface::Job).
                         with_arguments(job_id: current_job.job_id).
                         first
                     return if !job_task
@@ -184,7 +214,7 @@ module Syskit
                     tasks = placeholder_task.generated_subgraph(Roby::TaskStructure::Dependency)
                     tasks << job_task
                 else
-                    tasks = syskit_log_stream.plan.known_tasks
+                    tasks = plan.known_tasks
                 end
 
                 all_tasks.merge(tasks.to_set)
